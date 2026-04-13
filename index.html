@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>粒子文字</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #080810; overflow: hidden; }
+    canvas { display: block; }
+
+    #ui {
+      position: fixed;
+      bottom: 48px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+    }
+
+    #text-input {
+      width: 560px;
+      max-width: 90vw;
+      padding: 14px 32px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 40px;
+      color: #fff;
+      font-size: 20px;
+      font-family: "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", Arial, sans-serif;
+      text-align: center;
+      outline: none;
+      backdrop-filter: blur(12px);
+      transition: border-color 0.4s, box-shadow 0.4s;
+      letter-spacing: 2px;
+    }
+    #text-input:focus {
+      border-color: rgba(255, 255, 255, 0.3);
+      box-shadow: 0 0 24px rgba(255, 255, 255, 0.06);
+    }
+    #text-input::placeholder { color: rgba(255, 255, 255, 0.16); }
+
+    #hint {
+      color: rgba(255, 255, 255, 0.12);
+      font-size: 13px;
+      font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+      letter-spacing: 1px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="ui">
+    <input id="text-input" type="text" placeholder="输入文字，粒子将缓缓聚合…" maxlength="40" autocomplete="off" spellcheck="false">
+    <span id="hint">支持中文与英文</span>
+  </div>
+
+<script>
+'use strict';
+
+// ── Canvas ────────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('canvas');
+const ctx    = canvas.getContext('2d');
+const input  = document.getElementById('text-input');
+
+let W = 0, H = 0;
+
+function resize() {
+  const w = window.innerWidth  || document.documentElement.clientWidth  || 1280;
+  const h = window.innerHeight || document.documentElement.clientHeight || 720;
+  if (w === W && h === H) return;
+  W = canvas.width  = w;
+  H = canvas.height = h;
+}
+resize();
+
+// Retry resize until we have real dimensions (some embeds start at 0×0)
+(function ensureSize() {
+  if (W === 0 || H === 0) { resize(); requestAnimationFrame(ensureSize); }
+})();
+
+window.addEventListener('resize', () => {
+  resize();
+  if (input.value.trim()) scheduleAssign(input.value);
+});
+
+// ── Physics config ────────────────────────────────────────────────────────────
+const COUNT      = 2000;
+const SPRING     = 0.003;   // very weak pull → dreamy slow convergence
+const FRICTION   = 0.965;   // high → slow deceleration, long glide
+const WANDER_F   = 0.986;   // wandering friction — barely any drag
+const MOUSE_R    = 120;     // mouse repulsion radius
+const MOUSE_F    = 0.6;     // mouse repulsion strength
+
+// ── Mouse tracking ───────────────────────────────────────────────────────────
+let mouseX = -9999, mouseY = -9999;
+
+canvas.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
+canvas.addEventListener('mouseleave', () => { mouseX = -9999; mouseY = -9999; });
+
+// ── Particle ──────────────────────────────────────────────────────────────────
+class Particle {
+  constructor() {
+    this.x  = Math.random() * W;
+    this.y  = Math.random() * H;
+    this.vx = 0;
+    this.vy = 0;
+
+    // Wander
+    this.angle     = Math.random() * Math.PI * 2;
+    this.turnSpeed = 0.004 + Math.random() * 0.006;  // very slow direction drift
+    this.wanderAcc = 0.003 + Math.random() * 0.004;  // tiny push per frame
+
+    // Target (null → wander)
+    this.tx = null;
+    this.ty = null;
+
+    // Visual
+    this.size       = 1.0 + Math.random() * 1.4;
+    this.phaseShift = Math.random() * Math.PI * 2;
+    this.baseAlpha  = 0.35 + Math.random() * 0.50;
+  }
+}
+
+const particles = Array.from({ length: COUNT }, () => new Particle());
+
+// ── Text → pixel positions ────────────────────────────────────────────────────
+function samplePixels(text) {
+  if (!text.trim()) return [];
+
+  const oc   = document.createElement('canvas');
+  oc.width   = W;
+  oc.height  = H;
+  const octx = oc.getContext('2d');
+
+  const charLen  = [...text].length;
+  let   fontSize = Math.min(H * 0.42, (W * 0.85) / charLen * 1.1);
+  fontSize = Math.max(28, Math.min(fontSize, 230));
+
+  octx.font         = `bold ${fontSize}px "Microsoft YaHei","PingFang SC","Hiragino Sans GB",Arial,sans-serif`;
+  octx.textAlign    = 'center';
+  octx.textBaseline = 'middle';
+  octx.fillStyle    = '#fff';
+  octx.fillText(text, W / 2, H / 2);
+
+  const { data } = octx.getImageData(0, 0, W, H);
+  const pts = [];
+
+  for (let y = 0; y < H; y += 2) {
+    for (let x = 0; x < W; x += 2) {
+      if (data[((y * W) + x) * 4 + 3] > 110) {
+        pts.push(x, y);
+      }
+    }
+  }
+  return pts;   // flat: [x0,y0, x1,y1, ...]
+}
+
+// Fisher-Yates shuffle on paired flat array
+function shufflePairs(arr) {
+  const n = arr.length >> 1;
+  for (let i = n - 1; i > 0; i--) {
+    const j  = (Math.random() * (i + 1)) | 0;
+    const ai = i * 2, aj = j * 2;
+    let t = arr[ai];   arr[ai]   = arr[aj];   arr[aj]   = t;
+        t = arr[ai+1]; arr[ai+1] = arr[aj+1]; arr[aj+1] = t;
+  }
+}
+
+// ── Target assignment (nearest-neighbor, ALL particles join) ──────────────────
+//
+//  Every particle gets a target — none are left wandering.
+//  If there are more particles than sampled pixels, extras share a position
+//  with a tiny random jitter so they cluster naturally around the letterform.
+//
+//  Nearest-neighbor matching keeps transitions smooth:
+//    "你" → "你好"  →  particles near "你" stay, edge ones peel off to "好"
+//
+function assignTargets(text) {
+  const pts       = samplePixels(text);
+  const pairCount = pts.length >> 1;
+  if (pairCount === 0) { clearTargets(); return; }
+
+  shufflePairs(pts);
+
+  // Build target pool — enough for ALL particles.
+  // If fewer pixels than particles, cycle through pixels with small jitter.
+  const pool = new Array(COUNT);
+  for (let i = 0; i < COUNT; i++) {
+    const src = (i % pairCount) * 2;
+    const jx  = i < pairCount ? 0 : (Math.random() - 0.5) * 3;
+    const jy  = i < pairCount ? 0 : (Math.random() - 0.5) * 3;
+    pool[i] = { x: pts[src] + jx, y: pts[src + 1] + jy, taken: false };
+  }
+
+  // Separate particles into "already targeted" vs "wandering"
+  const targeted  = [];
+  const wandering = [];
+  for (const p of particles) {
+    if (p.tx !== null) targeted.push(p);
+    else               wandering.push(p);
+  }
+
+  // ── Phase 1: re-assign targeted particles to nearest available target ──
+  for (const p of targeted) {
+    let bestIdx  = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < COUNT; i++) {
+      if (pool[i].taken) continue;
+      const dx = pool[i].x - p.x;
+      const dy = pool[i].y - p.y;
+      const d  = dx * dx + dy * dy;
+      if (d < bestDist) { bestDist = d; bestIdx = i; }
+    }
+    if (bestIdx >= 0) {
+      pool[bestIdx].taken = true;
+      p.tx = pool[bestIdx].x;
+      p.ty = pool[bestIdx].y;
+    }
+  }
+
+  // ── Phase 2: assign remaining targets to wandering particles ──
+  const wanderUsed = new Uint8Array(wandering.length);
+
+  for (let i = 0; i < COUNT; i++) {
+    if (pool[i].taken) continue;
+
+    let bestIdx  = -1;
+    let bestDist = Infinity;
+    for (let j = 0; j < wandering.length; j++) {
+      if (wanderUsed[j]) continue;
+      const dx = pool[i].x - wandering[j].x;
+      const dy = pool[i].y - wandering[j].y;
+      const d  = dx * dx + dy * dy;
+      if (d < bestDist) { bestDist = d; bestIdx = j; }
+    }
+    if (bestIdx >= 0) {
+      wandering[bestIdx].tx = pool[i].x;
+      wandering[bestIdx].ty = pool[i].y;
+      wanderUsed[bestIdx]   = 1;
+      pool[i].taken = true;
+    }
+  }
+}
+
+function clearTargets() {
+  for (const p of particles) {
+    if (p.tx !== null) {
+      // Give a gentle outward push so particles scatter naturally
+      const angle = Math.random() * Math.PI * 2;
+      const force = 0.3 + Math.random() * 0.5;
+      p.vx += Math.cos(angle) * force;
+      p.vy += Math.sin(angle) * force;
+    }
+    p.tx = null;
+    p.ty = null;
+  }
+}
+
+// ── Simulation ────────────────────────────────────────────────────────────────
+let tick = 0;
+
+function update() {
+  tick++;
+
+  const mr2 = MOUSE_R * MOUSE_R;  // squared radius for mouse check
+
+  for (let i = 0; i < COUNT; i++) {
+    const p = particles[i];
+
+    if (p.tx !== null) {
+      // Soft spring → very gradual convergence
+      const dx = p.tx - p.x;
+      const dy = p.ty - p.y;
+      p.vx = (p.vx + dx * SPRING) * FRICTION;
+      p.vy = (p.vy + dy * SPRING) * FRICTION;
+    } else {
+      // Dreamy slow wander
+      p.angle += (Math.random() - 0.5) * p.turnSpeed;
+      p.vx = (p.vx + Math.cos(p.angle) * p.wanderAcc) * WANDER_F;
+      p.vy = (p.vy + Math.sin(p.angle) * p.wanderAcc) * WANDER_F;
+    }
+
+    // ── Mouse repulsion ──
+    const mdx = p.x - mouseX;
+    const mdy = p.y - mouseY;
+    const md2 = mdx * mdx + mdy * mdy;
+    if (md2 < mr2 && md2 > 1) {
+      const dist = Math.sqrt(md2);
+      const force = (1 - dist / MOUSE_R) * MOUSE_F;
+      p.vx += (mdx / dist) * force;
+      p.vy += (mdy / dist) * force;
+    }
+
+    p.x += p.vx;
+    p.y += p.vy;
+
+    // Soft edge wrap
+    if      (p.x < -6)     p.x = W + 6;
+    else if (p.x > W + 6)  p.x = -6;
+    if      (p.y < -6)     p.y = H + 6;
+    else if (p.y > H + 6)  p.y = -6;
+  }
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function draw() {
+  // Slow fade → motion trails
+  ctx.fillStyle = 'rgba(8, 8, 16, 0.18)';
+  ctx.fillRect(0, 0, W, H);
+
+  for (let i = 0; i < COUNT; i++) {
+    const p       = particles[i];
+    const shimmer = Math.sin(tick * 0.015 + p.phaseShift) * 0.12;
+    const alpha   = Math.max(0.08, p.baseAlpha + shimmer);
+
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255,255,255,${alpha.toFixed(3)})`;
+    ctx.fill();
+  }
+}
+
+// ── Loop ──────────────────────────────────────────────────────────────────────
+let lastW = W, lastH = H;
+
+function loop() {
+  // If canvas just got real dimensions, scatter particles across it
+  resize();
+  if (W !== lastW || H !== lastH) {
+    if (lastW === 0 || lastH === 0) {
+      for (const p of particles) {
+        p.x = Math.random() * W;
+        p.y = Math.random() * H;
+      }
+    }
+    lastW = W;
+    lastH = H;
+  }
+
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+loop();
+
+// ── Input ─────────────────────────────────────────────────────────────────────
+let debounceTimer = null;
+
+function scheduleAssign(text) {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    if (text.trim()) assignTargets(text);
+    else             clearTargets();
+  }, 80);
+}
+
+input.addEventListener('input', () => scheduleAssign(input.value));
+</script>
+</body>
+</html>
